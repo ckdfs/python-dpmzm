@@ -78,6 +78,8 @@ def generate_dataset(
     pilot_freqs=None,
     pilot_amps=None,
     deltaV_range=0.5,
+    deltaV_focus=0.2,
+    focus_ratio=0.8,
     save_path="dataset_bias_control.npz",
 ):
     """生成用于偏置控制的训练数据集。
@@ -110,9 +112,16 @@ def generate_dataset(
 
     for n in range(N_samples):
         # 随机采样当前样本的偏置改变量 ΔV_I/Q/P
-        dV_I = np.random.uniform(-deltaV_range, deltaV_range)
-        dV_Q = np.random.uniform(-deltaV_range, deltaV_range)
-        dV_P = np.random.uniform(-deltaV_range, deltaV_range)
+        # 其中大部分样本集中在较小范围 [-deltaV_focus, deltaV_focus] 内，
+        # 少部分样本覆盖到全范围 [-deltaV_range, deltaV_range]，
+        # 这样可以提高小偏差区域的学习精度。
+        in_focus = (np.random.rand() < focus_ratio)
+        dv_low = - (deltaV_focus if in_focus else deltaV_range)
+        dv_high = (deltaV_focus if in_focus else deltaV_range)
+
+        dV_I = np.random.uniform(dv_low, dv_high)
+        dV_Q = np.random.uniform(dv_low, dv_high)
+        dV_P = np.random.uniform(dv_low, dv_high)
 
         V_I_bias = V_bias_I0 + dV_I
         V_Q_bias = V_bias_Q0 + dV_Q
@@ -168,8 +177,13 @@ def generate_dataset(
             f_cpu = f
             Power_RF_dBm_cpu = Power_RF_dBm
 
+        # 防止极端值导致 Inf/NaN：先对频谱做合理裁剪
+        Power_RF_dBm_cpu = np.clip(Power_RF_dBm_cpu, -200.0, 200.0)
+
         # 提取 6 个“信号-本地噪底”特征
         rel_feats = extract_relative_pilot_features(f_cpu, Power_RF_dBm_cpu, pilot_freqs_sample)
+        # 再次确保特征中没有 Inf/NaN
+        rel_feats = np.nan_to_num(rel_feats, neginf=-200.0, posinf=200.0)
 
         # 构造导频参数特征（频率、幅度），统一按 Hz 和 V 存储
         pilot_param_feats = np.array([
@@ -204,4 +218,11 @@ def generate_dataset(
 
 
 if __name__ == "__main__":
-    generate_dataset(N_samples=100000, save_path="dataset_bias_control.npz")
+    # 默认生成更多样本，并增强小偏差样本比例，以降低 RMSE
+    generate_dataset(
+        N_samples=300000,
+        deltaV_range=0.5,
+        deltaV_focus=0.2,
+        focus_ratio=0.8,
+        save_path="dataset_bias_control.npz",
+    )

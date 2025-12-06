@@ -17,7 +17,7 @@ def init_backend():
         use_gpu = True
 
         dev = cp.cuda.Device()
-        print(f"检测到 GPU: {cp.cuda.runtime.getDeviceProperties(dev.id)['name'].decode('utf-8')}")
+        # print(f"检测到 GPU: {cp.cuda.runtime.getDeviceProperties(dev.id)['name'].decode('utf-8')}")
         return xp, use_gpu, cp, mempool, pinned_mempool
     except ImportError:
         import numpy as cp  # Fallback 仅保证属性存在

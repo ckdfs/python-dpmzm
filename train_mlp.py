@@ -31,10 +31,13 @@ class BiasControlDataset(Dataset):
 class MLPRegressor(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super().__init__()
+        # 稍微加大网络容量：12 -> 128 -> 128 -> 64 -> 3
         self.net = nn.Sequential(
-            nn.Linear(input_dim, 64),
+            nn.Linear(input_dim, 128),
             nn.ReLU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, output_dim),
         )
@@ -46,7 +49,7 @@ class MLPRegressor(nn.Module):
 def train(
     npz_path: str = "dataset_bias_control.npz",
     batch_size: int = 256,
-    num_epochs: int = 1000,
+    num_epochs: int = 500,
     lr: float = 1e-3,
     train_ratio: float = 0.8,
     device: str | None = None,
