@@ -1,6 +1,7 @@
 import numpy as np
+import torch
 from dpmzm_nonideal_model import dpmzm_nonideal_model
-from test_dpmzm import build_params, init_backend, photodetect_and_add_noise, electrical_spectrum
+from test_dpmzm import build_params, photodetect_and_add_noise, electrical_spectrum
 
 
 def generate_pilot_tones(t, freqs, amps):
@@ -90,11 +91,11 @@ def generate_dataset(
     if pilot_amps is None:
         pilot_amps = {"I": 0.02, "Q": 0.02, "P": 0.02}
 
-    xp, use_gpu, cp, mempool, pinned_mempool = init_backend()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     params, total_optical_loss_db, p_in_dbm_base, ein_base, responsivity, r_load = build_params()
 
-    # 仅在 CPU 上生成时间轴 (导频在循环内按样本随机)
-    t = np.arange(0, T_total, 1.0 / Fs)
+    # 时间轴（torch，便于直接上 GPU）
+    t_torch = torch.arange(0, T_total, 1.0 / Fs, device=device, dtype=torch.float64)
 
     # 定义一个基准偏置点 (此处使用 build_params 中的 NULL/QUAD 方案)
     BIAS_MAX = 0.0
@@ -130,43 +131,31 @@ def generate_dataset(
             "P": pilot_amps["P"] * np.random.uniform(0.8, 1.2),
         }
 
-        V_I_pilot, V_Q_pilot, V_P_pilot = generate_pilot_tones(t, pilot_freqs_sample, pilot_amps_sample)
+        # 用 PyTorch 在 GPU/CPU 上生成导频并完成全链路计算
+        V_I_pilot = pilot_amps_sample["I"] * torch.sin(2 * torch.pi * t_torch * pilot_freqs_sample["I"])
+        V_Q_pilot = pilot_amps_sample["Q"] * torch.sin(2 * torch.pi * t_torch * pilot_freqs_sample["Q"])
+        V_P_pilot = pilot_amps_sample["P"] * torch.sin(2 * torch.pi * t_torch * pilot_freqs_sample["P"])
 
-        # 构造总电压波形 (偏置 + 导频)，先在 CPU 上计算
-        V_I_t_cpu = V_I_bias + V_I_pilot
-        V_Q_t_cpu = V_Q_bias + V_Q_pilot
-        V_P_t_cpu = V_P_bias + V_P_pilot
+        V_I_t = torch.as_tensor(V_I_bias, device=device) + V_I_pilot
+        V_Q_t = torch.as_tensor(V_Q_bias, device=device) + V_Q_pilot
+        V_P_t = torch.as_tensor(V_P_bias, device=device) + V_P_pilot
 
-        # 转移到 xp (GPU 或 CPU) 数组
-        V_I_t = xp.asarray(V_I_t_cpu)
-        V_Q_t = xp.asarray(V_Q_t_cpu)
-        V_P_t = xp.asarray(V_P_t_cpu)
-
-        # 为每个样本随机输入光功率，在一个范围内浮动
         p_in_dbm = p_in_dbm_base + np.random.uniform(-3.0, 3.0)
         ein = np.sqrt(10 ** ((p_in_dbm - 30.0) / 10.0))
-        Ein_t = xp.ones_like(V_I_t, dtype=xp.complex128) * ein
+        Ein_t = torch.ones_like(V_I_t, dtype=torch.complex128) * ein
 
-        # 运行 DPMZM 模型
-        from test_dpmzm import run_dpmzm_model
+        E_out_t, P_out_ideal = dpmzm_nonideal_model(Ein_t, V_I_t, V_Q_t, V_P_t, params)
+        P_out_t = P_out_ideal * (10 ** (-total_optical_loss_db / 10.0))
 
-        E_out_t, P_out_t = run_dpmzm_model(Ein_t, V_I_t, V_Q_t, V_P_t, params, total_optical_loss_db)
-
-        # PD 探测并加噪声
-        I_PD_pure, I_PD_noisy, I_AC_t, P_noise_density_dBm_Hz, P_noise_density_W_Hz = photodetect_and_add_noise(
-            xp, P_out_t, responsivity, r_load, Fs, use_gpu
+        # PD + 噪声 + 频谱（torch）
+        _, _, I_AC_t, P_noise_density_dBm_Hz, P_noise_density_W_Hz = photodetect_and_add_noise(
+            P_out_t, responsivity, r_load, Fs
         )
+        f_t, Power_RF_dBm_t, L = electrical_spectrum(I_AC_t, Fs, r_load)
 
-        # 电学频谱
-        f, Power_RF_dBm, L = electrical_spectrum(xp, I_AC_t, Fs, r_load)
-
-        # 为后续特征提取，把频谱与频率轴搬回 CPU (np)
-        if use_gpu and cp is not None:
-            f_cpu = cp.asnumpy(f)
-            Power_RF_dBm_cpu = cp.asnumpy(Power_RF_dBm)
-        else:
-            f_cpu = f
-            Power_RF_dBm_cpu = Power_RF_dBm
+        # 搬回 CPU 做特征
+        f_cpu = f_t.cpu().numpy()
+        Power_RF_dBm_cpu = Power_RF_dBm_t.cpu().numpy()
 
         # 提取 6 个“信号-本地噪底”特征
         rel_feats = extract_relative_pilot_features(f_cpu, Power_RF_dBm_cpu, pilot_freqs_sample)

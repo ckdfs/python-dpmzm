@@ -2,17 +2,9 @@
 import numpy as np
 import torch
 
-from generate_dataset import (
-    generate_pilot_tones,
-    extract_relative_pilot_features,
-)
-from test_dpmzm import (
-    build_params,
-    init_backend,
-    photodetect_and_add_noise,
-    electrical_spectrum,
-    run_dpmzm_model,
-)
+from generate_dataset import extract_relative_pilot_features
+from test_dpmzm import build_params, photodetect_and_add_noise, electrical_spectrum
+from dpmzm_nonideal_model import dpmzm_nonideal_model
 
 
 class BiasControlMLP(torch.nn.Module):
@@ -65,18 +57,16 @@ def simulate_measurement(
         X_sample: 12 维特征 [6 个相对功率, 3 个导频频率, 3 个导频幅度]。
         rel_feats: 长度为 6 的导频一阶/二阶“相对噪底”特征 (dB)。
     """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if pilot_freqs_center is None:
         pilot_freqs_center = {"I": 0.75e3, "Q": 1e3, "P": 1.25e3}
     if pilot_amps_center is None:
         pilot_amps_center = {"I": 0.02, "Q": 0.02, "P": 0.02}
 
-    xp, use_gpu, cp, mempool, pinned_mempool = init_backend()
-    params, total_optical_loss_db, p_in_dbm, ein, responsivity, r_load = build_params()
+    params, total_optical_loss_db, p_in_dbm_base, _, responsivity, r_load = build_params()
 
-    # 时间轴
-    t = np.arange(0, T_total, 1.0 / Fs)
+    t = torch.arange(0, T_total, 1.0 / Fs, device=device, dtype=torch.float64)
 
-    # 为本次测量随机导频（与数据集生成时的策略保持一致）
     pilot_freqs_sample = {
         "I": pilot_freqs_center["I"] * np.random.uniform(0.9, 1.1),
         "Q": pilot_freqs_center["Q"] * np.random.uniform(0.9, 1.1),
@@ -88,41 +78,32 @@ def simulate_measurement(
         "P": pilot_amps_center["P"] * np.random.uniform(0.8, 1.2),
     }
 
-    V_I_pilot, V_Q_pilot, V_P_pilot = generate_pilot_tones(t, pilot_freqs_sample, pilot_amps_sample)
+    V_I_pilot = pilot_amps_sample["I"] * torch.sin(2 * torch.pi * t * pilot_freqs_sample["I"])
+    V_Q_pilot = pilot_amps_sample["Q"] * torch.sin(2 * torch.pi * t * pilot_freqs_sample["Q"])
+    V_P_pilot = pilot_amps_sample["P"] * torch.sin(2 * torch.pi * t * pilot_freqs_sample["P"])
 
-    # 构造电压波形
-    V_I_t_cpu = V_I_bias + V_I_pilot
-    V_Q_t_cpu = V_Q_bias + V_Q_pilot
-    V_P_t_cpu = V_P_bias + V_P_pilot
+    V_I_t = torch.as_tensor(V_I_bias, device=device) + V_I_pilot
+    V_Q_t = torch.as_tensor(V_Q_bias, device=device) + V_Q_pilot
+    V_P_t = torch.as_tensor(V_P_bias, device=device) + V_P_pilot
 
-    V_I_t = xp.asarray(V_I_t_cpu)
-    V_Q_t = xp.asarray(V_Q_t_cpu)
-    V_P_t = xp.asarray(V_P_t_cpu)
+    p_in_dbm = p_in_dbm_base + np.random.uniform(-3.0, 3.0)
+    ein = np.sqrt(10 ** ((p_in_dbm - 30.0) / 10.0))
+    Ein_t = torch.ones_like(V_I_t, dtype=torch.complex128) * ein
 
-    Ein_t = xp.ones_like(V_I_t, dtype=xp.complex128) * ein
+    E_out_t, P_out_ideal = dpmzm_nonideal_model(Ein_t, V_I_t, V_Q_t, V_P_t, params)
+    P_out_t = P_out_ideal * (10 ** (-total_optical_loss_db / 10.0))
 
-    # 调制器输出
-    E_out_t, P_out_t = run_dpmzm_model(Ein_t, V_I_t, V_Q_t, V_P_t, params, total_optical_loss_db)
-
-    # PD + 噪声
-    I_PD_pure, I_PD_noisy, I_AC_t, P_noise_density_dBm_Hz, P_noise_density_W_Hz = photodetect_and_add_noise(
-        xp, P_out_t, responsivity, r_load, Fs, use_gpu
+    _, _, I_AC_t, P_noise_density_dBm_Hz, _ = photodetect_and_add_noise(
+        P_out_t, responsivity, r_load, Fs
     )
 
-    # 频谱
-    f, Power_RF_dBm, L = electrical_spectrum(xp, I_AC_t, Fs, r_load)
+    f_t, Power_RF_dBm_t, _ = electrical_spectrum(I_AC_t, Fs, r_load)
 
-    if use_gpu and cp is not None:
-        f_cpu = cp.asnumpy(f)
-        Power_RF_dBm_cpu = cp.asnumpy(Power_RF_dBm)
-    else:
-        f_cpu = f
-        Power_RF_dBm_cpu = Power_RF_dBm
+    f_cpu = f_t.detach().cpu().numpy()
+    Power_RF_dBm_cpu = Power_RF_dBm_t.detach().cpu().numpy()
 
-    # 6 个“信号-噪底”特征
     rel_feats = extract_relative_pilot_features(f_cpu, Power_RF_dBm_cpu, pilot_freqs_sample)
 
-    # 6 个导频参数特征
     pilot_param_feats = np.array(
         [
             pilot_freqs_sample["I"],
