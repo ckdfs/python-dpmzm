@@ -34,7 +34,7 @@ def load_trained_model(model_path: str = "mlp_bias_control_best.pth", device: st
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     input_dim = int(checkpoint["input_dim"])
     output_dim = int(checkpoint["output_dim"])
 
